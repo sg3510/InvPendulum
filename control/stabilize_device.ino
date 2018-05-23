@@ -7,18 +7,19 @@
 // for both classes must be in the include path of your project
 #include <I2Cdev.h>
 #include <L3GD20H.h>
+#include <MPU6050.h>
 
-
-// specific I2C address may be passed here
 L3GD20H gyro;
+MPU6050 mpu;
 
 // define global vars
-int16_t avx, avy, avz;
+int16_t avx, avy, avz; // vars for use for gyro
+int16_t accY, accZ, gyroX; // vars for use with mpu
 double dvx, dvy, dvz, x, y, z, xBias, yBias, zBias;
 double timeStep, timeCurr, timePrev;
 
-volatile int motorPower;
-volatile float currentAngle, prevAngle = 0, error, prevError = 0, errorSum = 0;
+volatile int motorPower, gyroRate;
+volatile float accAngle, gyroAngle, currentAngle, prevAngle = 0, error, prevError = 0, errorSum = 0;
 
 bool blinkState = false;
 
@@ -44,11 +45,30 @@ bool blinkState = false;
 #define voltageMotorMax  5.0
 int minPWMout, maxPWMout;
 
+// hardware select for MPU / gyro
+#define useMPUSensor false
+#define isHighPassFilterEnabled false // flag for enabling hardware high pass filter on gyro
+
 void setup() {
-  setup_L3GH20H();
+
+  if(useMPUSensor) {
+      // run setup routine for MPU6050
+      setup_MPU6050();
+  } else {
+      // run setup routine for L3GH20H
+      setup_L3GH20H();
+  }
 
   // configure LED for output
   pinMode(LED_PIN, OUTPUT);
+
+  // set the motor control and PWM pins to output mode
+  pinMode(leftMotorPWMPin, OUTPUT);
+  pinMode(leftMotorDirPin1, OUTPUT);
+  pinMode(leftMotorDirPin2, OUTPUT);
+  pinMode(rightMotorPWMPin, OUTPUT);
+  pinMode(rightMotorDirPin1, OUTPUT);
+  pinMode(rightMotorDirPin2, OUTPUT);
 
   // calculate min/max PWM output values based on supply voltage and motor tolerence
   minPWMout = 0;  // TODO(nick): implement min voltage cutoff
@@ -60,8 +80,6 @@ void setup() {
 }
 
 void setup_L3GH20H() {
-
-    #define isHighPassFilterEnabled false // flag for enabling hardware high pass filter
   
     // join I2C bus (I2Cdev library doesn't do this automatically)
     Wire.begin();
@@ -70,7 +88,7 @@ void setup_L3GH20H() {
     Serial.begin(9600);
 
     // initialize device
-    Serial.println("Initializing I2C devices...");
+    Serial.println("Initializing L3GH20H...");
     gyro.initialize();
 
     // verify connection
@@ -92,12 +110,12 @@ void setup_L3GH20H() {
 
     // use hardware high pass fiter if enabled
     if (isHighPassFilterEnabled) {
-      Serial.println("Enabling High Pass Filter");
-      gyro.setDataFilter(L3GD20H_HIGH_PASS);
-      gyro.setHighPassFilterEnabled(true);
-      gyro.setHighPassMode(L3GD20H_HPM_NORMAL);
-      gyro.setHighPassFilterReference(L3GD20H_HPCF10);
-      gyro.setHighPassFilterCutOffFrequencyLevel(L3GD20H_HPCF10);
+        Serial.println("Enabling High Pass Filter");
+        gyro.setDataFilter(L3GD20H_HIGH_PASS);
+        gyro.setHighPassFilterEnabled(true);
+        gyro.setHighPassMode(L3GD20H_HPM_NORMAL);
+        gyro.setHighPassFilterReference(L3GD20H_HPCF10);
+        gyro.setHighPassFilterCutOffFrequencyLevel(L3GD20H_HPCF10);
     }
 
     // set scale to 250
@@ -107,11 +125,11 @@ void setup_L3GH20H() {
     gyro.getAngularVelocity(&avx, &avy, &avz);
     delay(200);
     for (int i = 0; i <= 999; i++){
-      gyro.getAngularVelocity(&avx, &avy, &avz);
-      x = x + avx * 0.00875F;
-      y = y + avy * 0.00875F;
-      z = z + avz * 0.00875F;
-      delay(5);
+        gyro.getAngularVelocity(&avx, &avy, &avz);
+        x = x + avx * 0.00875F;
+        y = y + avy * 0.00875F;
+        z = z + avz * 0.00875F;
+        delay(5);
     }
 
     // set bias constants for gyro starting position
@@ -120,21 +138,28 @@ void setup_L3GH20H() {
     zBias = z / 1000.0;
 }
 
+void setup_MPU6050() {
+
+    // join I2C bus (I2Cdev library doesn't do this automatically)
+    Wire.begin();
+
+    // initialize serial communication
+    Serial.begin(9600);
+
+    // initialize device
+    Serial.println("Initializing MPU6050...");
+    mpu.initialize();
+
+    // set MPU offsets
+    mpu.setYAccelOffset(0);
+    mpu.setZAccelOffset(0);
+    mpu.setXGyroOffset(0);
+}
+
 void loop() {
 
     // calculate angular position using L3GD20H gyro
-    // TODO(nick): can I return an array of the three values instead of modifying global vars?
-    getAngularPosition_L3GD20H();
-
-    // dump x,y,z values to serial out for debugging
-    Serial.print("Absolute angle (degrees):\t");
-    Serial.print(x,DEC); Serial.print("\t");
-    Serial.print(y,DEC); Serial.print("\t");
-    Serial.print(z,DEC); Serial.print("\t");
-    Serial.println();
-
-    // Use y axis angle for stabilization basis
-    currentAngle = y;
+    currentAngle = getAngularPosition();
 
     // calculate error and constrain cumulative errorSum to prevent overflow
     error = currentAngle - targetAngle;
@@ -159,6 +184,76 @@ void loop() {
     digitalWrite(LED_PIN, blinkState);
 }
 
+float getAngularPosition() {
+
+    float angleValue = 0;
+
+    // get angle of inclination from MPU or gyro sensor depending on hardware selection
+    if(useMPUSensor){
+      
+        // read acceleration and gyroscope values from MPU6050
+        accY = mpu.getAccelerationY();
+        accZ = mpu.getAccelerationZ();
+        gyroX = mpu.getRotationX();
+        
+        // calculate time delta since last iteration
+        timePrev = timeCurr;
+        timeCurr = millis();
+        timeStep = ((timeCurr - timePrev) / 1000.0);
+    
+        // calculate the angle of inclination
+        accAngle = atan2(accY, accZ) * RAD_TO_DEG;
+        gyroRate = map(gyroX, -32768, 32767, -250, 250);
+        gyroAngle = (float)gyroRate * timeStep;
+    
+        // angle of inclination is calculated using a complementary filter which
+        // uses data from the gyro and accelerometer in the MPU
+        angleValue = 0.9934 * (prevAngle + gyroAngle) + 0.0066 * (accAngle);
+        
+   } else{
+    
+        // read raw angular velocity measurements from L3GD20H gyro
+        gyro.getAngularVelocity(&avx, &avy, &avz);
+    
+        // calculate time delta since last iteration
+        timePrev = timeCurr;
+        timeCurr = millis();
+        timeStep = ((timeCurr - timePrev) / 1000.0);
+        
+        // scale raw velocity measurements using 0.00875F (from L3GD20H datasheet)
+        dvx = avx * 0.00875F - xBias;
+        dvy = avy * 0.00875F - yBias;
+        dvz = avz * 0.00875F - zBias;
+    
+        // apply thresholding to eliminate sensor drift
+        if (abs(dvx) <= 0.5) dvx = 0.0;
+        if (abs(dvy) <= 0.5) dvy = 0.0;
+        if (abs(dvz) <= 0.5) dvz = 0.0;
+    
+        // calculate angles in each axis
+        x = normaliseAngle(x + (dvx * timeStep));
+        y = normaliseAngle(y + (dvy * timeStep));
+        z = normaliseAngle(z + (dvz * timeStep));
+    
+        // dump x,y,z values to serial out for debugging
+        Serial.print("Absolute angle (degrees):\t");
+        Serial.print(x, DEC); Serial.print("\t");
+        Serial.print(y, DEC); Serial.print("\t");
+        Serial.print(z, DEC); Serial.print("\t");
+        Serial.println();
+    
+        // Use y axis angle for angle of inclination
+        angleValue = y;
+    }
+       
+    // dump angleValue to serial out for debugging
+    Serial.print("Angle of inclination (degrees):\t");
+    Serial.print(angleValue, DEC);
+    Serial.println();
+
+    // return angle of inclination
+    return angleValue;
+}
 
 double normaliseAngle(double angle)
 {
@@ -167,56 +262,6 @@ double normaliseAngle(double angle)
     while (newAngle > 180.0) newAngle -= 360.0;
     return newAngle;
 }
-
-void getAngularPosition_L3GD20H() {
-  
-    // read raw angular velocity measurements from L3GD20H gyro
-    gyro.getAngularVelocity(&avx, &avy, &avz);
-
-    // scale raw velocity measurements using 0.00875F (from L3GD20H datasheet)
-    dvx = avx * 0.00875F - xBias;
-    dvy = avy * 0.00875F - yBias;
-    dvz = avz * 0.00875F - zBias;
-
-    // apply thresholding to eliminate sensor drift
-    if (abs(dvx) <= 0.5) dvx = 0.0;
-    if (abs(dvy) <= 0.5) dvy = 0.0;
-    if (abs(dvz) <= 0.5) dvz = 0.0;
- 
-    timePrev = timeCurr;
-    timeCurr = millis();
-    timeStep = ((timeCurr - timePrev) / 1000.0);
-    
-    x = normaliseAngle(x + (dvx*timeStep));
-    y = normaliseAngle(y + (dvy*timeStep));
-    z = normaliseAngle(z + (dvz*timeStep));
-    
-    // // read X memory address directly
-    // uint8_t xval_l, xval_h;
-    // uint8_t devAddress = 0x6B;
-    // uint8_t regAddXL = 0x28;
-    // uint8_t regAddXH = 0x29;
-    // I2Cdev::readByte(devAddress, regAddXL, &xval_l);
-    // I2Cdev::readByte(devAddress, regAddXH, &xval_h);
-    // // read X memory addresses in single sequential
-    // uint8_t data[2];
-    // I2Cdev::readBytes(devAddress, regAddXL| 0x80, 2, data);
-    
-    // Serial.print("Direct Mem Read: Xl: "); 
-    // Serial.print(xval_l); Serial.print("\tXh: ");
-    // Serial.print(xval_h); Serial.print("\t");
-    // Serial.print("Direct readBytes data[0] data[1]: ");
-    // Serial.print(data[0]); Serial.print("\t");
-    // Serial.print(data[1]); Serial.print("\t");
-    // Serial.print("Bitshifted: "); Serial.print((((int16_t)data[1]) << 8) | data[0]);
-    // Serial.print("angular velocity (dps):\t");
-    // Serial.print(dvx,DEC); Serial.print("\t");
-    // Serial.print(dvy,DEC); Serial.print("\t");
-    // Serial.print(dvz,DEC); Serial.print("\t");
-    // Serial.print(" x read only: "); Serial.print(x_single);
-    // Serial.print(" y read only: "); Serial.println(y_single);
-}
-
 
 void setMotors(int leftMotorSpeed, int rightMotorSpeed) {
 
