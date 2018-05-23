@@ -158,7 +158,7 @@ void setup_MPU6050() {
 
 void loop() {
 
-    // calculate angular position using L3GD20H gyro
+    // get updated angular position
     currentAngle = getAngularPosition();
 
     // calculate error and constrain cumulative errorSum to prevent overflow
